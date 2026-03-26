@@ -1,0 +1,13 @@
+{
+    "submission_name": "SETOL Spectral Patch (Muon WD)",
+    "description": "Integrated spectral diagnostics for Parameter Golf. Includes Spectral Convergence Oracle for QAT/warmdown triggering, AlphaDecay for per-parameter Muon WD scaling, and Stable-Rank GPTQ for Hessian-aware quantization.",
+    "track": "10min_16mb",
+    "timestamp": "2026-03-26T23:11:00Z",
+    "author": "SETOL/SpectralPatch-Team",
+    "features": [
+        "SpectralMonitor (ᾱ tracking)",
+        "AlphaDecay Muon WD scaling",
+        "α-selective dynamic bit-width (int8/int6)",
+        "Stable-Rank aware GPTQ clipping"
+    ]
+}
