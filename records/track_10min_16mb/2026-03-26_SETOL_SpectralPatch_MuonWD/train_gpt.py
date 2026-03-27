@@ -398,7 +398,7 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     # Initialize distributed group
-    if not dist.is_initialized():
+    if "RANK" in os.environ and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     master = (local_rank == 0)
 
@@ -454,7 +454,8 @@ def main():
         with open("final_model.int8.ptz", "wb") as f: f.write(zlib.compress(buf.getvalue(), 9))
         print("Saved final_model.int8.ptz")
 
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
