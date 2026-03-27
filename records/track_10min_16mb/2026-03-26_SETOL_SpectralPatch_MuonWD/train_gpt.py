@@ -118,15 +118,17 @@ class EMA:
                     self.shadow[n].copy_(self.decay * self.shadow[n] + (1.0 - self.decay) * p.detach())
 
     def apply(self, model: nn.Module) -> None:
-        for n, p in model.named_parameters():
-            if n in self.shadow:
-                self.backup[n] = p.clone().detach()
-                p.copy_(self.shadow[n])
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n in self.shadow:
+                    self.backup[n] = p.clone().detach()
+                    p.copy_(self.shadow[n])
 
     def restore(self, model: nn.Module) -> None:
-        for n, p in model.named_parameters():
-            if n in self.backup:
-                p.copy_(self.backup[n])
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n in self.backup:
+                    p.copy_(self.backup[n])
         self.backup.clear()
 
 def build_sentencepiece_luts(sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device):
