@@ -821,7 +821,6 @@ def main() -> None:
                     loss = ddp_model(x, y)
                 (loss * grad_scale).backward()
             for opt in optimizers: opt.step()
-            ema.update(model)
             if ws + 1 <= 20 or (ws + 1) % 10 == 0: log0(f"warmup_step:{ws+1}/{args.warmup_steps}")
         model.load_state_dict(initial_state)
         zero_grad_all()
