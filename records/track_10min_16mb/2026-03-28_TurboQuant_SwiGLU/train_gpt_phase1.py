@@ -211,6 +211,48 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
+# EMA (EXPONENTIAL MOVING AVERAGE)
+# -----------------------------
+
+class EMA:
+    """Maintains an exponential moving average of model parameters.
+
+    Usage:
+        ema = EMA(model, decay=0.999)
+        # after each optimizer step:
+        ema.update(model)
+        # before validation:
+        ema.apply(model)
+        val_loss = evaluate(model)
+        ema.restore(model)
+    """
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow = {n: p.clone().detach() for n, p in model.named_parameters()}
+        self.backup: dict = {}
+
+    def update(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n in self.shadow:
+                    self.shadow[n].copy_(self.decay * self.shadow[n] + (1.0 - self.decay) * p.detach())
+
+    def apply(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n in self.shadow:
+                    self.backup[n] = p.clone().detach()
+                    p.copy_(self.shadow[n])
+
+    def restore(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n in self.backup:
+                    p.copy_(self.backup[n])
+        self.backup.clear()
+
+
+# -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION
 # -----------------------------
 
