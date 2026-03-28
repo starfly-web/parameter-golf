@@ -73,13 +73,13 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
 
     # Dropout & EMA
-    dropout = float(os.environ.get("DROPOUT", 0.0))
+    dropout = float(os.environ.get("DROPOUT", 0.1))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.03))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -89,7 +89,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    muon_wd = float(os.environ.get("MUON_WD", 0.01))
+    muon_wd = float(os.environ.get("MUON_WD", 0.05))
 
     # LoRA TTT
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
@@ -499,12 +499,11 @@ def eval_val_ttt_lora(args: Hyperparameters, base_model: nn.Module, rank: int, w
     all_tokens_for_docs = load_validation_tokens(args.val_files, 1).to(device)
     all_docs = _find_docs(all_tokens_for_docs, include_next_bos=True)
     rank_docs = all_docs[(len(all_docs) * rank) // world_size : (len(all_docs) * (rank + 1)) // world_size]
-    lora = BatchedTTTLoRA(args.ttt_batch_size, base_model, args.ttt_lora_rank).to(device).bfloat16()
-    opt = _build_ttt_optimizer(lora, args)
-    chunk_size, seq_len = args.ttt_chunk_size, args.ttt_eval_seq_len
     for i in range(0, len(rank_docs), args.ttt_batch_size):
         batch_docs = rank_docs[i : i + args.ttt_batch_size]
         bsz = len(batch_docs)
+        lora = BatchedTTTLoRA(bsz, base_model, args.ttt_lora_rank).to(device).bfloat16()
+        opt = _build_ttt_optimizer(lora, args)
         lora.reset(); _reset_ttt_optimizer(opt)
         num_chunks = [(d[1] - d[0] + chunk_size - 1) // chunk_size for d in batch_docs]
         max_chunks = max(num_chunks)
@@ -539,7 +538,7 @@ def eval_val_ttt_lora(args: Hyperparameters, base_model: nn.Module, rank: int, w
                         _accumulate_bpb(ptl.detach(), x, y, b, co, cl, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, loss_sum, byte_sum, token_count)
             if needs_train:
                 mask = torch.tensor([float(ci < num_chunks[b] - 1) for b in range(bsz)], device=device)
-                per_doc = ptl[:, chunk_offset : chunk_offset + chunk_size].mean(dim=-1)
+                per_doc = ptl.mean(dim=-1)
                 opt.zero_grad(); (per_doc * mask).sum().backward(); opt.step()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM); dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM); dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -572,13 +571,14 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat((x[..., :h] * cos + x[..., h:] * sin, x[..., :h] * (-sin) + x[..., h:] * cos), dim=-1)
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads, num_kv, rope_base, qk_gain):
+    def __init__(self, dim, num_heads, num_kv, rope_base, qk_gain, dropout=0.0):
         super().__init__()
         self.nh, self.nkv, self.dh = num_heads, num_kv, dim // num_heads
         self.c_q, self.c_k, self.c_v = CastedLinear(dim, dim, False), CastedLinear(dim, num_kv*self.dh, False), CastedLinear(dim, num_kv*self.dh, False)
         self.proj = CastedLinear(dim, dim, False)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain))
         self.rotary = Rotary(self.dh, rope_base)
+        self.dropout = dropout
     def forward(self, x, qd=None, vd=None):
         bsz, sl, _ = x.shape
         q = self.c_q(x) + (qd if qd is not None else 0)
@@ -594,22 +594,24 @@ class Attention(nn.Module):
         c, s = self.rotary(sl, x.device, q.dtype)
         q, k = apply_rotary_emb(q, c, s), apply_rotary_emb(k, c, s)
         q = q * self.q_gain[None, :, None, None].to(q.dtype)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
         return self.proj(y.transpose(1, 2).contiguous().view(bsz, sl, -1))
 
 class MLP(nn.Module):
-    def __init__(self, dim, mult):
+    def __init__(self, dim, mult, dropout=0.0):
         super().__init__()
         h = int(dim * mult)
         self.w1, self.w2, self.proj = CastedLinear(dim, h, False), CastedLinear(dim, h, False), CastedLinear(h, dim, False)
-    def forward(self, x): return self.proj(F.silu(self.w1(x)) * self.w2(x))
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        return self.proj(self.dropout(F.silu(self.w1(x)) * self.w2(x)))
 
 class Block(nn.Module):
-    def __init__(self, dim, nh, nkv, mult, rope, qk_gain):
+    def __init__(self, dim, nh, nkv, mult, rope, qk_gain, dropout=0.0):
         super().__init__()
         self.norm1, self.norm2 = RMSNorm(), RMSNorm()
-        self.attn = Attention(dim, nh, nkv, rope, qk_gain)
-        self.mlp = MLP(dim, mult)
+        self.attn = Attention(dim, nh, nkv, rope, qk_gain, dropout=dropout)
+        self.mlp = MLP(dim, mult, dropout=dropout)
         self.ascl, self.mscl = nn.Parameter(torch.ones(dim)), nn.Parameter(torch.ones(dim))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))))
     def forward(self, x, x0, qd=None, vd=None):
@@ -621,10 +623,10 @@ class Block(nn.Module):
         return x
 
 class GPT(nn.Module):
-    def __init__(self, v, l, d, nh, nkv, mult, tie, tie_std, logit_softcap, rope, qk_gain):
+    def __init__(self, v, l, d, nh, nkv, mult, tie, tie_std, logit_softcap, rope, qk_gain, dropout=0.0):
         super().__init__()
         self.tok_emb = nn.Embedding(v, d)
-        self.blocks = nn.ModuleList([Block(d, nh, nkv, mult, rope, qk_gain) for _ in range(l)])
+        self.blocks = nn.ModuleList([Block(d, nh, nkv, mult, rope, qk_gain, dropout=dropout) for _ in range(l)])
         self.norm = RMSNorm()
         self.logit_softcap = logit_softcap
         self.lm_head = CastedLinear(d, v, False) if not tie else None
@@ -778,7 +780,7 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
 
     # ── Model + optimizer setup ─────────────────────────────────────────────
-    model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init).to(device).bfloat16()
+    model = GPT(args.vocab_size, args.num_layers, args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.tie_embeddings, args.tied_embed_init_std, args.logit_softcap, args.rope_base, args.qk_gain_init, dropout=args.dropout).to(device).bfloat16()
     
     spectral = ParameterGolfSpectralPatch(model, args, master_process)
     muon_groups = spectral.patch_muon_param_groups()
@@ -801,7 +803,6 @@ def main() -> None:
 
     # ── Data loader + warmup ─────────────────────────────────────────────────
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    ema = EMA(model, args.ema_decay)
 
     def zero_grad_all():
         for opt in optimizers: opt.zero_grad(set_to_none=True)
@@ -824,6 +825,9 @@ def main() -> None:
             if ws + 1 <= 20 or (ws + 1) % 10 == 0: log0(f"warmup_step:{ws+1}/{args.warmup_steps}")
         model.load_state_dict(initial_state)
         zero_grad_all()
+
+    # EMA shadow initialization (after any warmup weight resets)
+    ema = EMA(model, args.ema_decay)
 
     # ── Main training loop ───────────────────────────────────────────────────
     training_time_ms, step = 0.0, 0
