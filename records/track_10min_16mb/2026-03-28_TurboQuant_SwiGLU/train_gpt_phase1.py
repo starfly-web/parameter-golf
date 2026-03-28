@@ -463,16 +463,17 @@ LLOYD_MAX_CENTROIDS: dict[int, Tensor] = {
     2: torch.tensor([-0.6745, -0.2248,  0.2248,  0.6745]),
     3: torch.tensor([-0.8416, -0.5244, -0.2533, -0.0836,
                       0.0836,  0.2533,  0.5244,  0.8416]),
-    4: torch.tensor([-0.9325, -0.7063, -0.5095, -0.3319,
-                     -0.1658,  0.0000,  0.1658,  0.3319,
-                      0.5095,  0.7063,  0.9325,  1.0000]),
+    4: torch.tensor([-1.0000, -0.8656, -0.7333, -0.6027,
+                     -0.4728, -0.3439, -0.2153, -0.0870,
+                      0.0870,  0.2153,  0.3439,  0.4728,
+                      0.6027,  0.7333,  0.8656,  1.0000]),
 }
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,tok_emb",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -574,7 +575,7 @@ def optimal_encode_turboquant_indices(q_indices: dict[str, Tensor], meta: dict[s
         centroids = LLOYD_MAX_CENTROIDS[b].numpy()
         boundaries = (centroids[:-1] + centroids[1:]) / 2.0
         a_param = d / 2.0
-        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf(bnd, a_param, a_param)) for bnd in boundaries] + [1.0]
+        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf((bnd + 1.0) / 2.0, a_param, a_param)) for bnd in boundaries] + [1.0]
         cdf_tensor = torch.tensor(cdf_vals, dtype=torch.float32).unsqueeze(0)
         
         sym = q.reshape(-1).to(torch.int16)
@@ -599,7 +600,7 @@ def optimal_decode_turboquant_indices(byte_stream: bytes, stream_lens: dict, met
         centroids = LLOYD_MAX_CENTROIDS[b].numpy()
         boundaries = (centroids[:-1] + centroids[1:]) / 2.0
         a_param = d / 2.0
-        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf(bnd, a_param, a_param)) for bnd in boundaries] + [1.0]
+        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf((bnd + 1.0) / 2.0, a_param, a_param)) for bnd in boundaries] + [1.0]
         cdf_tensor = torch.tensor(cdf_vals, dtype=torch.float32).unsqueeze(0)
         
         N = m["orig_shape"][0] * m["orig_shape"][1]
@@ -1503,18 +1504,17 @@ def main() -> None:
     # Compress the dense indices via near-optimal arithmetic coding instead of zlib
     indices_bytes, stream_lens = optimal_encode_turboquant_indices(quant_obj.pop("quantized"), quant_obj["meta"])
     quant_obj["stream_lens"] = stream_lens
+    # FIX T2: embed arithmetic-coded indices as ByteTensor inside standard format
+    quant_obj["indices_data"] = torch.frombuffer(bytearray(indices_bytes), dtype=torch.uint8).clone()
     
     quant_buf  = io.BytesIO()
     torch.save(quant_obj, quant_buf)
-    quant_raw  = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = zlib.compress(quant_buf.getvalue(), level=9)
     
     if master_process:
-        with open("final_model.tq.ptz", "wb") as f:
-            f.write(len(indices_bytes).to_bytes(8, "little"))
-            f.write(indices_bytes)
+        with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.tq.ptz")
+        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model TurboQuant+zlib: {quant_file_bytes} bytes "
              f"code: {code_bytes} bytes "
@@ -1523,12 +1523,9 @@ def main() -> None:
     if distributed:
         dist.barrier()
         
-    with open("final_model.tq.ptz", "rb") as f:
-        idx_len = int.from_bytes(f.read(8), "little")
-        indices_bytes = f.read(idx_len)
-        quant_blob_disk = f.read()
-        
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    with open("final_model.int8.ptz", "rb") as f:
+        quant_state = torch.load(io.BytesIO(zlib.decompress(f.read())), map_location="cpu")
+    indices_bytes = bytes(quant_state.pop("indices_data").numpy())
     quant_state["quantized"] = optimal_decode_turboquant_indices(indices_bytes, quant_state["stream_lens"], quant_state["meta"])
     base_model.load_state_dict(dequantize_state_dict_turboquant(quant_state), strict=True)
 
