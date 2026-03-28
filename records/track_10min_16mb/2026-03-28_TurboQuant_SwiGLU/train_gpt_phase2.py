@@ -479,13 +479,16 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 
 def fwht(x: Tensor) -> Tensor:
+    orig_shape = x.shape
+    n = orig_shape[-1]
+    x = x.reshape(-1, n)
     h = 1
-    while h < x.shape[-1]:
-        x = x.reshape(*x.shape[:-1], -1, 2 * h)
+    while h < n:
+        x = x.reshape(x.shape[0], -1, 2 * h)
         x = torch.cat([x[..., :h] + x[..., h:],
                        x[..., :h] - x[..., h:]], dim=-1)
         h *= 2
-    return x.reshape(*x.shape[:-1] if x.ndim > 1 else (-1,), -1)
+    return x.reshape(orig_shape)
 
 def _pad_to_pow2(x: Tensor) -> tuple[Tensor, int]:
     n = x.shape[-1]
@@ -512,7 +515,7 @@ def quantize_tensor_turboquant(t: Tensor, bits: int = 3, seed_offset: int = 0) -
         scales[i] = scale.half()
         rotated = turbo_srht_row(row / scale, seed_offset + i)
         dists = (rotated.unsqueeze(-1) - centroids).abs()
-        q_indices[i] = dists.argmin(dim=-1).to(torch.int8)
+        q_indices[i] = dists.argmin(dim=-1).view(-1).to(torch.int8)
 
     return q_indices, scales
 
