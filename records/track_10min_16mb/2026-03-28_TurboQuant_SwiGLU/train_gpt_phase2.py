@@ -641,7 +641,10 @@ class TurboQuantKVCache(nn.Module):
         x_rot  = centroids[q_mse.long()]
         signs  = self._signs[:d].to(scale.dtype)
         x_inv  = fwht(x_rot) / d
-        return (x_inv * signs) * scale.unsqueeze(-1)
+        # Broadcast scale to match x_inv rank (k may be reshaped by RoPE to 5+ dims)
+        while scale.dim() < x_inv.dim():
+            scale = scale.unsqueeze(-1)
+        return (x_inv * signs) * scale
 
 
 class _TQKVCacheOp(torch.autograd.Function):
