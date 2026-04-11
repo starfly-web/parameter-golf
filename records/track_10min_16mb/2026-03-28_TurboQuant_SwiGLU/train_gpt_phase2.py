@@ -57,10 +57,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 
 class Hyperparameters:
-    data_path          = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path          = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
     train_files        = os.path.join(data_path, "fineweb_train_*.bin")
     val_files          = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path     = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path     = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
     run_id             = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed               = int(os.environ.get("SEED", 1337))
 
@@ -78,7 +78,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init       = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    vocab_size         = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size         = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers         = int(os.environ.get("NUM_LAYERS", 10))
     # Recurrence: loop a contiguous range of layers num_loops times.
     # Set loop_start_layer = loop_end_layer = -1 to loop ALL layers.
@@ -463,10 +463,9 @@ LLOYD_MAX_CENTROIDS: dict[int, Tensor] = {
     2: torch.tensor([-0.6745, -0.2248,  0.2248,  0.6745]),
     3: torch.tensor([-0.8416, -0.5244, -0.2533, -0.0836,
                       0.0836,  0.2533,  0.5244,  0.8416]),
-    4: torch.tensor([-1.0000, -0.8656, -0.7333, -0.6027,
-                     -0.4728, -0.3439, -0.2153, -0.0870,
-                      0.0870,  0.2153,  0.3439,  0.4728,
-                      0.6027,  0.7333,  0.8656,  1.0000]),
+    4: torch.tensor([-0.9325, -0.7063, -0.5095, -0.3319,
+                     -0.1658,  0.0000,  0.1658,  0.3319,
+                      0.5095,  0.7063,  0.9325,  1.0000]),
 }
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -479,16 +478,13 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 
 def fwht(x: Tensor) -> Tensor:
-    orig_shape = x.shape
-    n = orig_shape[-1]
-    x = x.reshape(-1, n)
     h = 1
-    while h < n:
-        x = x.reshape(x.shape[0], -1, 2 * h)
+    while h < x.shape[-1]:
+        x = x.reshape(*x.shape[:-1], -1, 2 * h)
         x = torch.cat([x[..., :h] + x[..., h:],
                        x[..., :h] - x[..., h:]], dim=-1)
         h *= 2
-    return x.reshape(orig_shape)
+    return x.reshape(*x.shape[:-1] if x.ndim > 1 else (-1,), -1)
 
 def _pad_to_pow2(x: Tensor) -> tuple[Tensor, int]:
     n = x.shape[-1]
@@ -515,7 +511,7 @@ def quantize_tensor_turboquant(t: Tensor, bits: int = 3, seed_offset: int = 0) -
         scales[i] = scale.half()
         rotated = turbo_srht_row(row / scale, seed_offset + i)
         dists = (rotated.unsqueeze(-1) - centroids).abs()
-        q_indices[i] = dists.argmin(dim=-1).view(-1).to(torch.int8)
+        q_indices[i] = dists.argmin(dim=-1).to(torch.int8)
 
     return q_indices, scales
 
@@ -578,7 +574,7 @@ def optimal_encode_turboquant_indices(q_indices: dict[str, Tensor], meta: dict[s
         centroids = LLOYD_MAX_CENTROIDS[b].numpy()
         boundaries = (centroids[:-1] + centroids[1:]) / 2.0
         a_param = d / 2.0
-        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf((bnd + 1.0) / 2.0, a_param, a_param)) for bnd in boundaries] + [1.0]
+        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf(bnd, a_param, a_param)) for bnd in boundaries] + [1.0]
         cdf_tensor = torch.tensor(cdf_vals, dtype=torch.float32).unsqueeze(0)
         
         sym = q.reshape(-1).to(torch.int16)
@@ -603,7 +599,7 @@ def optimal_decode_turboquant_indices(byte_stream: bytes, stream_lens: dict, met
         centroids = LLOYD_MAX_CENTROIDS[b].numpy()
         boundaries = (centroids[:-1] + centroids[1:]) / 2.0
         a_param = d / 2.0
-        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf((bnd + 1.0) / 2.0, a_param, a_param)) for bnd in boundaries] + [1.0]
+        cdf_vals = [0.0] + [float(scipy.stats.beta.cdf(bnd, a_param, a_param)) for bnd in boundaries] + [1.0]
         cdf_tensor = torch.tensor(cdf_vals, dtype=torch.float32).unsqueeze(0)
         
         N = m["orig_shape"][0] * m["orig_shape"][1]
@@ -644,7 +640,7 @@ class TurboQuantKVCache(nn.Module):
         d = q_mse.shape[-1]
         x_rot  = centroids[q_mse.long()]
         signs  = self._signs[:d].to(scale.dtype)
-        x_inv  = fwht(x_rot) / math.sqrt(d)   # FIX T3: was / d, must be / sqrt(d)
+        x_inv  = fwht(x_rot) / d
         return (x_inv * signs) * scale.unsqueeze(-1)
 
 
@@ -652,12 +648,14 @@ class _TQKVCacheOp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, tq_module: TurboQuantKVCache) -> Tensor:
         q_mse, scale = tq_module.quantize(x)
-        # FIX T8: removed unused ctx.save_for_backward and ctx.tq_module
+        ctx.saved_shape = x.shape
+        ctx.save_for_backward(q_mse, scale)
+        ctx.tq_module = tq_module
         return tq_module.dequantize(q_mse, scale).view_as(x)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None]:
-        # Straight-through estimator
+        # Straight-through estimator for gradients passing through the dropping cache
         return grad_output, None
 
 
@@ -1565,17 +1563,18 @@ def main() -> None:
     # Compress the dense indices via near-optimal arithmetic coding instead of zlib
     indices_bytes, stream_lens = optimal_encode_turboquant_indices(quant_obj.pop("quantized"), quant_obj["meta"])
     quant_obj["stream_lens"] = stream_lens
-    # FIX T2: embed arithmetic-coded indices as ByteTensor inside standard format
-    quant_obj["indices_data"] = torch.frombuffer(bytearray(indices_bytes), dtype=torch.uint8).clone()
     
     quant_buf  = io.BytesIO()
     torch.save(quant_obj, quant_buf)
-    quant_blob = zlib.compress(quant_buf.getvalue(), level=9)
+    quant_raw  = quant_buf.getvalue()
+    quant_blob = zlib.compress(quant_raw, level=9)
     
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.tq.ptz", "wb") as f:
+            f.write(len(indices_bytes).to_bytes(8, "little"))
+            f.write(indices_bytes)
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.tq.ptz")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model TurboQuant+zlib: {quant_file_bytes} bytes "
              f"code: {code_bytes} bytes "
@@ -1584,9 +1583,12 @@ def main() -> None:
     if distributed:
         dist.barrier()
         
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_state = torch.load(io.BytesIO(zlib.decompress(f.read())), map_location="cpu")
-    indices_bytes = bytes(quant_state.pop("indices_data").numpy())
+    with open("final_model.tq.ptz", "rb") as f:
+        idx_len = int.from_bytes(f.read(8), "little")
+        indices_bytes = f.read(idx_len)
+        quant_blob_disk = f.read()
+        
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     quant_state["quantized"] = optimal_decode_turboquant_indices(indices_bytes, quant_state["stream_lens"], quant_state["meta"])
     base_model.load_state_dict(dequantize_state_dict_turboquant(quant_state), strict=True)
 
